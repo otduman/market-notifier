@@ -1,0 +1,154 @@
+# =============================================================================
+# market-notifier — Docker Compose Infrastructure
+# Services: Kafka (KRaft mode, no Zookeeper) + Redis
+# Version: cp-kafka:8.1.1 | redis:7-alpine
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # KAFKA (KRaft mode)
+  #
+  # KRaft = Kafka Raft — Kafka's built-in consensus protocol that REPLACES
+  # Zookeeper. Since Kafka 3.3 (stable), you no longer need a separate
+  # Zookeeper container. The broker manages its own metadata internally.
+  #
+  # This single container acts as BOTH broker AND controller simultaneously.
+  # This is called "combined mode" and is perfect for local development.
+  # In production you'd separate them, but for our MVP this is ideal.
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:8.1.1
+    container_name: market-notifier-kafka
+    hostname: kafka
+
+    ports:
+      # 9092 is exposed to your HOST machine (localhost:9092)
+      # This is how your Spring app (running locally in IntelliJ) reaches Kafka
+      - "9092:9092"
+      # 29092 is the INTERNAL port used inside the Docker network
+      # (only relevant if you had other containers talking to Kafka)
+
+    environment:
+      # --- KRaft Identity ---
+      # NODE_ID: unique numeric ID for this Kafka node
+      KAFKA_NODE_ID: 1
+
+      # PROCESS_ROLES: this node is BOTH a broker (handles client requests)
+      # AND a controller (handles cluster metadata/leadership).
+      # In production these would be separate nodes.
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      # --- Cluster Identity ---
+      # CLUSTER_ID: a unique base64 UUID that identifies this Kafka cluster.
+      # IMPORTANT: This must be exactly 22 characters of base64.
+      # If you ever delete the Docker volume and recreate the container,
+      # this ID must stay the same OR you must also delete the data volume.
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+
+      # --- Listener Configuration ---
+      # Kafka has two concepts: LISTENERS (what addresses Kafka binds to)
+      # and ADVERTISED_LISTENERS (what addresses Kafka tells clients to use).
+      # We define 3 listeners:
+      #   PLAINTEXT        → internal Docker network (container-to-container)
+      #   PLAINTEXT_HOST   → your host machine (Spring app in IntelliJ → Kafka)
+      #   CONTROLLER       → KRaft internal controller communication
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+
+      # Kafka binds to these addresses inside the container
+      KAFKA_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://kafka:29093
+
+      # Kafka tells clients to connect to these addresses
+      # - Other containers use kafka:29092 (Docker internal DNS)
+      # - Your Spring app on the host uses localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+
+      # Which listener to use for broker-to-broker communication
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # Which listener is dedicated to the KRaft controller
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # --- KRaft Quorum ---
+      # This tells the broker where to find the controller(s).
+      # Format: nodeId@host:port
+      # Since we only have one node (combined mode), it points to itself.
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+
+      # --- Topic Defaults (single-node development settings) ---
+      # REPLICATION_FACTOR: how many copies of each partition to keep.
+      # With only 1 broker, this MUST be 1. In production with 3 brokers, use 3.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      # GROUP_INITIAL_REBALANCE_DELAY_MS: how long to wait for consumers
+      # to join a group before the first rebalance. Set to 0 for fast local dev.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Where Kafka stores its log data inside the container
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+
+    volumes:
+      # Persist Kafka data between container restarts.
+      # Without this, every time you run 'docker compose down' and 'up' again,
+      # all your Kafka topics and messages would be gone.
+      - kafka-data:/var/lib/kafka/data
+
+    healthcheck:
+      # Verify Kafka is ready to accept connections before we declare it healthy.
+      # The Spring app and other services can use 'depends_on: condition: service_healthy'
+      # to wait for this healthcheck to pass before starting.
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s   # Give Kafka 30s to fully initialize before first check
+
+  # ---------------------------------------------------------------------------
+  # REDIS
+  #
+  # Redis is our in-memory data store for the rolling price window.
+  # We use the Alpine variant — it's the same Redis but built on Alpine Linux,
+  # which makes the image ~30MB instead of ~100MB. Perfect for development.
+  #
+  # We run Redis with:
+  # - appendonly yes: enables AOF (Append-Only File) persistence.
+  #   This means Redis writes every operation to disk so data survives restarts.
+  #   Without it, Redis is purely in-memory and loses everything on shutdown.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: market-notifier-redis
+    hostname: redis
+
+    ports:
+      # 6379 is Redis's default port.
+      # Your Spring app connects to localhost:6379.
+      - "6379:6379"
+
+    command: redis-server --appendonly yes
+
+    volumes:
+      # Persist Redis data between container restarts
+      - redis-data:/data
+
+    healthcheck:
+      # 'redis-cli ping' returns "PONG" if Redis is alive and ready
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+# =============================================================================
+# NAMED VOLUMES
+# Docker manages these storage volumes on your host machine.
+# They survive 'docker compose down' but are removed with 'docker compose down -v'.
+# Location on your machine: usually /var/lib/docker/volumes/ (Linux/Mac)
+# =============================================================================
+volumes:
+  kafka-data:
+    name: market-notifier-kafka-data
+  redis-data:
+    name: market-notifier-redis-data
