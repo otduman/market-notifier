@@ -8,6 +8,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
+import java.time.Instant;
+
 @Slf4j
 @RequiredArgsConstructor
 @Component
@@ -16,23 +19,23 @@ public class PriceEventConsumer {
     private final PriceStorageService priceStorageService;
     private final AlertService alertService;
 
-    // @KafkaListener is the heart of the consumer side.
-    //
-    // Spring Kafka creates a background thread (or thread pool) that
-    // continuously polls the Kafka topic. When a message arrives, Spring
-    // deserializes it (using the config from application.properties) and calls
-    // this method automatically.
-    //
-    // topics: which topic(s) to listen on
-    // groupId: the consumer group. Spring reads this from application.properties
-    // spring.kafka.consumer.group-id, but we can override per-listener.
-    // Using ${} syntax pulls it from properties — keeps it in one place.
-    //
-    // This method runs synchronously within the Kafka listener thread.
-    // If it throws an exception, Spring Kafka will handle it according to
-    // the error handler configuration (default: log and continue).
+    // Events older than this are skipped entirely.
+    // Must be >= PriceStorageService.HISTORY_DURATION_SECONDS (300s) to avoid
+    // writing entries that are immediately cleaned up on the next savePrice() call.
+    private static final Duration MAX_EVENT_AGE = Duration.ofMinutes(5);
+
     @KafkaListener(topics = "${app.kafka.topic}", groupId = "${spring.kafka.consumer.group-id}")
     public void consume(PriceEvent event) {
+        // Skip stale events from Kafka replay.
+        // When the app restarts, the consumer may replay old messages
+        // (auto-offset-reset=earliest). These have timestamps from hours/days ago.
+        // Saving them to Redis is pointless — they'd be added and immediately
+        // deleted by the ZREMRANGEBYSCORE cleanup in savePrice().
+        // Worse, the alert engine sees 0 data points because everything gets purged.
+        if (isStale(event)) {
+            return;
+        }
+
         log.debug("Consumed PriceEvent from Kafka: {} @ {} at {}",
                 event.getSymbol(), event.getPrice(), event.getTimestamp());
 
@@ -41,5 +44,10 @@ public class PriceEventConsumer {
 
         // Step 2: Check if this new price triggers any alert
         alertService.checkAndAlert(event);
+    }
+
+    private boolean isStale(PriceEvent event) {
+        Instant cutoff = Instant.now().minus(MAX_EVENT_AGE);
+        return event.getTimestamp().isBefore(cutoff);
     }
 }

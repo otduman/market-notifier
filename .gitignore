@@ -35,3 +35,6 @@ build/
 ### Antigravity / AI Tools ###
 .gemini/
 .agent/
+
+### Secrets ###
+.env
